@@ -24,19 +24,52 @@ while True:
         if raw_input("add or delete (a/d):")=="d":
             c.execute("DELETE FROM properties WHERE name=?", (raw_input("name:"),)) 
         else:
+            print "property types:"
+            for prop in c.execute("SELECT * FROM property_types"):
+                print "{0}".format(prop[0])
             c.execute("INSERT INTO properties(name,property_type,contact,notes) VALUES (?,?,?,?)", (raw_input("name:"),raw_input("property type:"),raw_input("contact:"),raw_input("notes:"))) 
         conn.commit()
         print "properties(name,property_type,contact,notes)"
         for row in c.execute("SELECT * FROM properties"):
             print row
     elif command=="s":
-        print "sensors(property,name,room_type)"
+        print "sensors(mac,property,name,room_type)"
         for row in c.execute("SELECT * FROM sensors"):
             print row
         if raw_input("add or delete (a/d):")=="d":
-            c.execute("DELETE FROM sensors WHERE id=?", (raw_input("id:"),)) 
+            c.execute("DELETE FROM sensors WHERE mac=?", (raw_input("mac:"),)) 
         else:
-            c.execute("INSERT INTO sensors(property,name,room_type) VALUES (?,?,?)", (raw_input("property:"),raw_input("sensor name:"),raw_input("room type:"))) 
+            print "properties:"
+            for prop in c.execute("SELECT * FROM unregistered_macs"):
+                print "{0}".format(prop[0])
+            print "room types:"
+            for prop in c.execute("SELECT * FROM room_types"):
+                print "{0}".format(prop[0])
+            unregistered_macs=c.execute("SELECT * FROM unregistered_macs")
+            mac_array=[]
+            print "unregistered_macs:"
+            i=0
+            for row in unregistered_macs:
+                print "{0}:{1}".format(i,row[0])
+                mac_array.append(row[0])
+                i+=1
+            response=raw_input("to register one of these macs enter its index, simply hit return to use a different mac:")
+            use_existing=False
+            mac_index=""
+            for char in response:
+                if char.isdigit():
+                    mac_index += char
+                    use_existing=True
+            mac_index=int(mac_index)
+            if use_existing and mac_index<i:
+                mac=mac_array[mac_index]
+                print "using {0} as mac".format(mac)
+                c.execute("INSERT INTO sensors(mac,property,name,room_type) VALUES (?,?,?,?)", (mac,raw_input("property:"),raw_input("sensor name:"),raw_input("room type:"))) 
+                c.execute("DELETE FROM unregistered_macs WHERE mac=?",(mac,))
+            else:
+                print "you will need to enter a mac manually"
+                c.execute("INSERT INTO sensors(mac,property,name,room_type) VALUES (?,?,?,?)", (raw_input("mac:"),raw_input("property:"),raw_input("sensor name:"),raw_input("room type:"))) 
+            conn.commit()
         print "sensors(property,name,room_type)"
         for row in c.execute("SELECT * FROM sensors"):
             print row

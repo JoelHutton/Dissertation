@@ -1,0 +1,687 @@
+/*
+ * Author: Joel Hutton
+ * Date Completed:2016-12-15
+ * This program sends sensor values to a server as well as sniffing
+ * wifi packets to determine what devices are nearby.
+ */
+
+#include "ESP8266WiFi.h"
+#include "ESP8266Ping.h"
+#include <WiFiUdp.h>
+#include <EEPROM.h>
+#include <dht.h>
+extern "C" {
+#include "c_types.h"
+#include "ets_sys.h"
+#include "os_type.h"
+#include "osapi.h"
+#include "mem.h"
+#include "user_interface.h"
+#include "smartconfig.h"
+#include "lwip/opt.h"
+#include "lwip/err.h"
+#include "lwip/dns.h"
+#include "user_interface.h"
+}
+
+dht DHT;
+#define DHT_PIN 2
+#define MOTION_PIN 12
+#define LED 5
+#define BUTTON 4
+#define TRANSMIT_INTERVAL 25000
+#define HOP_INTERVAL 2000
+
+extern "C" {  //required for read Vdd Voltage
+#include "user_interface.h"
+}
+
+int status = WL_IDLE_STATUS;
+//time last readings were sent (in milliseconds since startup)
+unsigned long lastTransmit=0;
+unsigned long startedSniffing=0;
+uint8_t startedChannel=0;
+unsigned long lastHop=0;
+const char* wifiKeyword="wifi:(";
+const char* macKeyword="macs:(";
+const char* clearKeyword="clear";
+byte macAddressHex[6];
+char macAddress[13];
+unsigned int localPort = 1234;// local port to listen for UDP packets
+unsigned int destPort = 1234; 
+const char* serverIP = "109.228.52.225";      // local port to listen for UDP packets
+const char* hex ="0123456789ABCDEF";
+char ssidBuf[64];//=NULL;
+char passwdBuf[64];//=NULL;
+//char* ssidBuf="khyber";
+//char* passwdBuf="khyberkey";
+#define CONNECT true 
+#define SNIFF   false
+bool deviceMode=CONNECT;
+
+byte packetBuffer[512]; //buffer to hold incoming and outgoing packets
+
+// A UDP instance to let us send and receive packets over UDP
+WiFiUDP Udp;
+
+unsigned long lastSeen[10];
+byte macTable[60];
+uint8_t numMacs=0;
+
+//compare to byte arrays for equality
+bool arrayCompare(byte *arr1, byte *arr2, int len){
+    for(int i=0; i<len; i++){
+        if(arr1[i]!=arr2[i]){
+            return false;
+        }
+    } 
+    return true;
+}
+
+void printHex(uint8_t *data, uint8_t start, uint8_t length){
+    char tmp[length*2+1];
+    int j=0;
+    for (uint8_t i=0; i<length; i++) 
+    {
+        tmp[j]=hex[data[i+start]>>4];
+        j++;
+        tmp[j]=hex[(data[i+start]&0x0F)];
+        j++;
+    }
+    tmp[length*2] = 0;
+    Serial.print(tmp);
+}
+
+char* formatMac(char* data){
+    char* macStr=(char*) malloc(sizeof(char)*(6*3));
+    byte first;
+    int j=0;
+    for (uint8_t i=0; i<6; i++) 
+    {
+        macStr[j]=hex[data[i]>>4];
+        j++;
+        macStr[j]=hex[(data[i]&0x0F)];
+        j++;
+        macStr[j]=':';
+        j++;
+    }
+    macStr[(6*3)-1] = '\0';
+    return macStr;
+}
+
+void printMac(char* data){
+    char* macStr=formatMac(data);
+    int i=0;
+    Serial.print(macStr);
+    /*
+       while(true){
+       if(macStr[i]=='\0'){
+       break;
+       }
+       Serial.print(macStr[i]); 
+       i++; 
+       }
+     */
+    free(macStr);
+}
+
+void channelHop()
+{
+    // 1 - 13 channel hopping
+    uint8 new_channel = wifi_get_channel() % 12 + 1;
+    wifi_set_channel(new_channel);
+    Serial.print("jumping to channel: ");
+    Serial.println(new_channel);
+}
+
+void printMacTable(){
+    Serial.println("macs:");
+    for(int i=0; i<numMacs;i++){
+        Serial.print("\t");
+        printMac((char*) (macTable+(sizeof(byte)*6*i)));
+        Serial.print("\t");
+        Serial.print("last seen: ");
+        if(lastSeen[i]==0){
+            Serial.print("\tnever\n");
+        }
+        else{
+            Serial.print((millis()-lastSeen[i])/1000);
+            Serial.print("\t seconds ago");
+            Serial.print("\tat ");
+            Serial.println(lastSeen[i]/1000);
+            Serial.print("\n");
+        }
+    }
+}
+
+//look for 802.11 frames with 
+static void ICACHE_FLASH_ATTR promiscCb(uint8 *buf, uint16 len)
+{
+#define ADDR1 16
+#define ADDR2 22
+#define ADDR3 28
+#define ADDR4 36
+    uint8_t addresses[3]={ADDR1,ADDR2,ADDR3};
+    for(int i=0; i<3;i++){ 
+        for(int j=0; j<numMacs;j++){
+            //macTable[j]==[current mac]
+            if( arrayCompare((buf+addresses[i]), macTable+(j*6*sizeof(byte)), 6) ){
+                //update the last seen time if the mac is already in the table
+                lastSeen[j]=millis();
+            }
+        }
+    }
+}
+
+//get mac address of chip and convert mac address from hex representation to string
+void getMac(){
+    WiFi.macAddress(macAddressHex);
+    for(int i=0; i<12; i++){
+        if(i%2==0){
+            macAddress[i]=hex[macAddressHex[i/2]>>4];  
+        }
+        else{
+            macAddress[i]=hex[macAddressHex[i/2]&0xF];
+        }
+    }
+    macAddress[13]='\0';
+}
+
+void printWifiStatus() {
+    String wifiStatus;
+    switch(WiFi.status()){
+        case (255):
+            wifiStatus="no shield";
+            break;
+        case (0):
+            wifiStatus="no ssid available";
+            break;
+        case (2):
+            wifiStatus="scan completed";
+            break;
+        case (3):
+            wifiStatus="connected";
+            break;
+        case (4):
+            wifiStatus="connect failed";
+            break;
+        case (5):
+            wifiStatus="connection lost";
+            break;
+        case (6):
+            wifiStatus="disconnected";
+            break;
+        default:
+            wifiStatus="unknown";
+            break;
+    }
+    // print the SSID of the network you're attached to:
+    Serial.print("status:");
+    Serial.println(wifiStatus);
+    Serial.print("SSID: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("BSSID: ");
+    printMac((char*) WiFi.BSSID());
+    Serial.print("\n");
+    Serial.print("Ping: ");
+    bool ret = Ping.ping("www.google.com");
+    Serial.println(ret);
+
+    IPAddress ip = WiFi.localIP();
+    Serial.print("IP Address: ");
+    Serial.println(ip);
+    Serial.print("MAC Address: ");
+    Serial.println(macAddress);
+}
+
+void writeCredentials(String ssid, String pass){
+    String writeString=wifiKeyword + ssid + "-" + pass +')' + '\0';
+    for(int i=0;i<writeString.length();i++){
+        EEPROM.write(i,writeString.charAt(i));
+    }
+    EEPROM.commit();
+}
+
+void writeMac(String mac){
+    Serial.print("writing mac: ");
+    Serial.println(mac);
+    int start=0;
+    //look for the end of the wifi:(passwd,ssid) block
+    for(int i=0; i<512;i++){
+        if(EEPROM.read(i)==')'){
+            numMacs=EEPROM.read(i+1);
+            start=i+2 + (6*numMacs);
+            numMacs++;
+            EEPROM.write(i+1,numMacs);
+            break; 
+        }
+    }
+    int i=start;
+    int j=0;
+    while(i<512 && j<mac.length()){
+        uint8_t toWrite=0;
+        uint8_t partA=0;
+        uint8_t partB=0;
+        //if char is 0-9
+        if(mac.charAt(j) >=48 and mac.charAt(j) <=57){
+            partA += (mac.charAt(j)-48) << 4;
+        }
+        else if(mac.charAt(j) >=65 and mac.charAt(j) <=70){
+            partA += (mac.charAt(j)-55) << 4;
+        }
+        Serial.print("toWrite = ");
+        Serial.print(partA);
+        Serial.print("+");
+        if(mac.charAt(j+1) >=48 and mac.charAt(j+1) <=57){
+            partB += (mac.charAt(j+1)-48);
+        }
+        else if(mac.charAt(j+1) >=65 and mac.charAt(j+1) <=70){
+            partB += (mac.charAt(j+1)-55);
+        }
+        toWrite=partA+partB;
+        Serial.print(toWrite);
+        Serial.print(" ");
+        EEPROM.write(i,toWrite);
+        i++;
+        //these are hex characters so 2 to a byte
+        j+=2;
+    }
+    while(i<512){
+        EEPROM.write(i,0);
+        i++;
+    }
+    Serial.println("");
+    EEPROM.commit();
+    dumpEEPROM(512);
+}
+
+
+void connectToRouter(){
+    deviceMode=CONNECT;
+    Serial.print("used memory:");
+    Serial.println(system_get_free_heap_size());
+    if(ssidBuf != NULL && passwdBuf != NULL){
+        // Wait for connection to AP
+        Serial.print("[Connecting]");
+        Serial.print(ssidBuf);
+        Serial.print(",");
+        Serial.print(passwdBuf);
+        //WiFi.begin(ssidBuf, passwdBuf);
+        //WiFi.begin(ssid, passwd);
+        int tries=0;
+        while(WiFi.status() != WL_CONNECTED) {
+            delay(500);
+            Serial.print(".");
+            tries++;
+            if (tries > 30){
+                break;
+            }
+        }
+        Serial.println();
+        //printWifiStatus();
+        Serial.print("UDP server started at port ");
+        Serial.println(localPort);
+        //Udp.begin(localPort);
+    }
+    else{
+        Serial.println("null pointers for ssid and/or passwd");
+    }
+}
+
+void dumpEEPROM(int limit){
+    Serial.println("EEPROM:");
+    for(int i=0; i<limit; i++){
+        Serial.print("\t");
+        Serial.print(i);
+        Serial.print(": ");
+        Serial.print(EEPROM.read(i));
+        Serial.print("\t");
+        Serial.print((char) EEPROM.read(i));
+        Serial.print("\t");
+        Serial.print( hex[EEPROM.read(i)>>4]);
+        Serial.println( hex[EEPROM.read(i)&0x0F]);
+    }
+
+}
+
+void handleUDP(){
+    int numBytes = Udp.parsePacket();
+    String receivedCommand = "";
+    //receive UDP packets to give wifi configuration
+    if (numBytes){
+        //debug 
+        Serial.print(millis() / 1000);
+        Serial.print(":Packet of ");
+        Serial.print(numBytes);
+        Serial.print(" received from ");
+        Serial.print(Udp.remoteIP());
+        Serial.print(":");
+        Serial.println(Udp.remotePort());
+        // We've received a packet, read the data from it
+        Udp.read(packetBuffer,numBytes); // read the packet into the buffer
+
+        // display the packet contents in HEX
+        for (int i=0;i<numBytes;i++){
+            Serial.print(packetBuffer[i-1],HEX);
+            receivedCommand = receivedCommand + char(packetBuffer[i]);
+            if (i % 32 == 0)
+            {
+                Serial.println();
+            }
+            else Serial.print(' ');
+        } // end for
+        Serial.println();
+
+        //respond to packet
+        //Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+        //Udp.write("Answer from ESP8266 ChipID#");
+        //Udp.print(system_get_chip_id());
+        //Udp.write("#IP of ESP8266#");
+        //Udp.println(WiFi.localIP());
+        //Udp.endPacket();
+
+        Serial.println(receivedCommand);
+        bool wifi=false;
+        if(numBytes>5){
+            wifi=arrayCompare((byte*) packetBuffer,(byte*) wifiKeyword, 6); 
+            /*
+               bool wifi=true;
+               for(int i=0;i<6;i++){
+               if( receivedCommand[i]!=wifiKeyword[i]){
+               wifi=false; 
+               break;
+               } 
+               }
+             */
+            if(wifi){
+                String ssid="";
+                String passwd="";
+                bool onPasswd=false;
+                for(int i=6; i<numBytes; i++){
+                    if(receivedCommand[i]=='-'){
+                        onPasswd=true;
+                    }
+                    else if(receivedCommand[i]==')'){
+                        break;
+                    }
+                    else if(onPasswd){
+                        passwd+=receivedCommand[i];
+                    }
+                    else{
+                        ssid+=receivedCommand[i];
+                    }
+                }
+                Serial.print("#");
+                Serial.print(ssid);
+                Serial.println("#");
+                Serial.print("#");
+                Serial.print(passwd);
+                Serial.println("#");
+                free(ssidBuf);
+                free(passwdBuf);
+                //ssidBuf=(char*) malloc((ssid.length()+1)*sizeof(char));
+                //passwdBuf=(char*) malloc((passwd.length()+1)*sizeof(char));
+                ssid.toCharArray(ssidBuf, ssid.length()+1);
+                passwd.toCharArray(passwdBuf, passwd.length()+1);
+                writeCredentials(ssid,passwd);
+                connectToRouter();
+            }
+            else{
+                bool macs=true;
+                for(int i=0;i<6;i++){
+                    if( receivedCommand[i]!=macKeyword[i]){
+                        macs=false; 
+                        break;
+                    } 
+                }
+                if(macs){
+                    Serial.println("macs received");
+                    String mac="";
+                    for(int i=6; i<numBytes; i++){
+                        if(receivedCommand[i]!=')'){
+                            mac+=receivedCommand[i];
+                            if((i-5)%12==0 && i!=6){
+                                writeMac(mac);
+                                mac="";
+                            }
+                        }
+                        else{
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if(!wifi && numBytes>=5){
+            bool clear=arrayCompare((byte*) packetBuffer,(byte*) clearKeyword, 5); 
+            if(clear){
+                Serial.println("clearing EEPROM");
+                for(int i=0;i<512;i++){
+                    EEPROM.write(i,0);
+                }
+                EEPROM.commit();
+            } 
+        }
+    }
+}
+
+void promiscMode(){
+    deviceMode=SNIFF;
+    //start sniffing
+    Serial.println(" -> Promisc mode setup ... ");
+    wifi_set_opmode_current(STATION_MODE);
+    wifi_station_disconnect();
+    wifi_promiscuous_enable(0);
+    wifi_set_promiscuous_rx_cb(promiscCb);
+    wifi_promiscuous_enable(1);
+    Serial.println("done.");
+    Serial.print(" -> Set opmode ... ");
+    wifi_set_opmode_current( 0x1 );
+    Serial.println("done.");
+    Serial.println(" -> Init finished!");
+    startedSniffing=millis(); 
+    startedChannel=wifi_get_channel();
+}
+
+void setup()
+{
+    // Open serial communications and wait for port to open:
+    Serial.begin(115200);
+    getMac();
+    EEPROM.begin(512);
+    int index=0;
+    //check for stored wifi credentials
+    bool wifi=true;
+    for(int i=0;i<6;i++){
+        if( EEPROM.read(i)!=wifiKeyword[i]){
+            wifi=false; 
+        }
+    }
+    //get stored wifi credentials/stored mac addresses
+    if(wifi){
+        Serial.println("stored credentials found");
+        String ssid=""; 
+        String passwd="";
+        bool onPasswd=false;
+        for(index=6;index<512;index++){
+            char c=EEPROM.read(index);
+            if(c=='-'){
+                onPasswd=true;
+            }
+            else if (c==')'){
+                break;
+            }
+            else if (onPasswd){
+                passwd+=c;
+            }
+            else{
+                ssid+=c;
+            }
+        }
+        //ssidBuf=(char*) malloc(sizeof(char)*(ssid.length()+1));
+        //passwdBuf=(char*) malloc(sizeof(char)*(passwd.length()+1));
+        ssid.toCharArray(ssidBuf, ssid.length()+1);
+        passwd.toCharArray(passwdBuf, passwd.length()+1);
+        Serial.print("ssid:");
+        Serial.println(ssidBuf);
+        Serial.print("password:");
+        Serial.println(passwdBuf);
+        index+=1;
+        numMacs=EEPROM.read(index);
+        index+=1;
+        Serial.print(numMacs);
+        Serial.print(" stored macs:");
+        if(numMacs > 0){
+            int finalIndex=index + (numMacs*6);
+            //macTable=(byte*) malloc(sizeof(byte)*numMacs*6);
+            //lastSeen=(unsigned long*) malloc(sizeof(unsigned long)*numMacs);
+            int i=0;
+            for(;index<=finalIndex;index++){
+                macTable[i]=EEPROM.read(index);
+                lastSeen[i]=0;
+                Serial.print(EEPROM.read(index));
+                Serial.print(" ");
+                i++;
+            }
+            Serial.print(" ");
+            printHex(macTable, 0, 6*numMacs);
+        }
+        Serial.print("\n");
+    }
+    //get wifi credentials through hotspot if there are none stored 
+    else{
+        Serial.println("no stored credentials found");
+        Serial.println("starting hotspot");
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.softAP(macAddress,"crocodile");
+        Serial.print("UDP server started at port ");
+        Serial.println(localPort);
+        Udp.begin(localPort);
+        while(ssidBuf==NULL || passwdBuf==NULL){
+            handleUDP();
+        }
+    }
+    //deviceMode=(EEPROM.read(511)==1); 
+    deviceMode=CONNECT; 
+    if(deviceMode==SNIFF){
+        Serial.println("going into sniff mode");
+        promiscMode();
+    }
+    //deviceMode==CONNECT
+    else{
+        Serial.println("going into connect mode");
+        connectToRouter();
+    }
+    pinMode(A0, INPUT);
+    pinMode(MOTION_PIN, INPUT);
+}
+unsigned long lastPrint=0;
+void loop()
+{
+    delay(5000);
+    if(deviceMode==SNIFF && millis()-lastPrint>=5000){
+        printMacTable();
+        lastPrint=millis();
+        if(millis()-lastHop>HOP_INTERVAL){
+            channelHop();
+        }
+        if(millis()-startedSniffing>TRANSMIT_INTERVAL){
+            for(int i=0;i<numMacs;i++){
+                if(lastSeen[i]!=0){
+                    EEPROM.write(510-i,1);
+                }
+                else{
+                    EEPROM.write(510-i,0);
+                }
+            }
+            EEPROM.write(511,1);
+            EEPROM.commit();
+            wifi_promiscuous_enable(0);
+            Serial.println("restarting");
+            ESP.restart();
+            while(true){
+
+            }
+        }
+    }
+
+    if(deviceMode==CONNECT){
+        handleUDP();
+        //send data to the server 
+        lastTransmit=millis();
+        int check=DHT.read11(DHT_PIN);
+        int temp=DHT.temperature;
+        int humidity=DHT.humidity;
+        int motion=digitalRead(MOTION_PIN);
+        digitalWrite(LED,motion);
+        int light=analogRead(A0);
+        String tempString= String(temp);
+        String humidityString= String(humidity);
+        String motionString= String(motion);
+        String lightString= String(light);
+        if(temp>-10 and temp<50){
+            Serial.print("t:");
+            Serial.print(tempString);
+        }
+        if(humidity>=0 and humidity<=100){
+            Serial.print(" h:");
+            Serial.print(humidityString);
+        }
+        Serial.print(" motion:");
+        Serial.print(motionString);
+        Serial.print(" light:");
+        Serial.print(lightString);
+        Serial.print(" button:");
+        Serial.print(digitalRead(BUTTON));
+
+        //send motion
+        Udp.beginPacket(serverIP, destPort);
+        Udp.print(macAddress);
+        Udp.print("-");
+        Udp.print("motion-");
+        Udp.print(motionString);
+        Udp.endPacket();
+
+        if(humidity>=0 and humidity<=100){
+            //send humidity
+            Udp.beginPacket(serverIP, destPort);
+            Udp.print(macAddress);
+            Udp.print("-");
+            Udp.print("humidity-");
+            Udp.print(humidityString);
+            Udp.endPacket();
+        }
+
+        if(temp>-10 and temp<50){
+            //send temperature
+            Udp.beginPacket(serverIP, destPort);
+            Udp.print(macAddress);
+            Udp.print("-");
+            Udp.print("temperature-");
+            Udp.print(tempString);
+            Udp.endPacket();
+        }
+       for(int i=0; i<numMacs;i++){ 
+           if(EEPROM.read(510-i)){
+               //printMac((char*) macTable+(sizeof(byte)*6*i));
+               //Serial.print("\n");
+           }
+       }
+        Serial.print("\n");
+
+        //send light level
+        Udp.beginPacket(serverIP, destPort);
+        Udp.print(macAddress);
+        Udp.print("-");
+        Udp.print("light-");
+        Udp.print(lightString);
+        Udp.endPacket();
+
+        EEPROM.write(511,0);
+        EEPROM.commit();
+        //Serial.println("restarting");
+        //ESP.restart();
+        //while(true){
+        //}
+    }
+}

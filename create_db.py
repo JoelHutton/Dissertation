@@ -32,21 +32,25 @@ c.execute('''CREATE TABLE properties
                      PRIMARY KEY(name)
                      )''')
 c.execute('''CREATE TABLE sensors
-                     (id INTEGER PRIMARY KEY,
+                     (mac TEXT,
                      property TEXT, 
                      name TEXT,
                      room_type TEXT,
+                     PRIMARY KEY(mac),
                      FOREIGN KEY(room_type) REFERENCES room_types(name),
                      CONSTRAINT namespace UNIQUE(name,property), 
                      FOREIGN KEY(property) REFERENCES properties(name) ON DELETE CASCADE)''')
 c.execute('''CREATE TABLE measurements
                      (time INTEGER,
-                     sensor INTEGER, 
+                     sensor TEXT, 
                      measurement_type TEXT, 
                      measurement REAL,
                      CONSTRAINT namespace UNIQUE(time,sensor,measurement_type,measurement),
                      FOREIGN KEY(measurement_type) REFERENCES measurement_types(name),
-                     FOREIGN KEY(sensor) REFERENCES sensors(id) ON DELETE CASCADE
+                     FOREIGN KEY(sensor) REFERENCES sensors(mac) ON DELETE CASCADE
+                    )''')
+c.execute('''CREATE TABLE unregistered_macs
+                     (mac TEXT
                     )''')
 
 # Insert a row of data
@@ -62,8 +66,8 @@ c.execute("INSERT INTO measurement_types VALUES ('motion')")
 c.execute("INSERT INTO measurement_types VALUES ('light')") 
 c.execute("INSERT INTO measurement_types VALUES ('humidity')") 
 c.execute("INSERT INTO properties(name,property_type,contact,notes) VALUES ('Joels Flat','flat','','')") 
-c.execute("INSERT INTO sensors(property,name,room_type) VALUES ('Joels Flat','bedroom 1','bedroom')") 
-c.execute("INSERT INTO measurements(time, sensor, measurement_type, measurement) VALUES ('1477753027',1,'temperature',15.0)") 
+#c.execute("INSERT INTO sensors(mac, property,name,room_type) VALUES ('Joels Flat','bedroom 1','bedroom')") 
+#c.execute("INSERT INTO measurements(time, sensor, measurement_type, measurement) VALUES ('1477753027',1,'temperature',15.0)") 
 # Save (commit) the changes
 conn.commit()
 
