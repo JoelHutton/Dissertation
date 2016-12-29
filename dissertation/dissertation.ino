@@ -9,7 +9,8 @@
 #include "ESP8266Ping.h"
 #include <WiFiUdp.h>
 #include <EEPROM.h>
-#include <dht.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 extern "C" {
 #include "c_types.h"
 #include "ets_sys.h"
@@ -24,8 +25,7 @@ extern "C" {
 #include "user_interface.h"
 }
 
-dht DHT;
-#define DHT_PIN 2
+#define TEMPERATURE_PIN 2
 #define MOTION_PIN 12
 #define LED 5
 #define BUTTON 4
@@ -35,6 +35,16 @@ dht DHT;
 extern "C" {  //required for read Vdd Voltage
 #include "user_interface.h"
 }
+// Data wire is plugged into pin 2 on the Arduino
+#define ONE_WIRE_BUS 2
+ 
+// Setup a oneWire instance to communicate with any OneWire devices 
+// (not just Maxim/Dallas temperature ICs)
+OneWire oneWire(ONE_WIRE_BUS);
+ 
+// Pass our oneWire reference to Dallas Temperature.
+DallasTemperature sensors(&oneWire);
+
 
 int status = WL_IDLE_STATUS;
 //time last readings were sent (in milliseconds since startup)
@@ -55,9 +65,11 @@ char ssidBuf[64];//=NULL;
 char passwdBuf[64];//=NULL;
 //char* ssidBuf="khyber";
 //char* passwdBuf="khyberkey";
-#define CONNECT true 
-#define SNIFF   false
-bool deviceMode=CONNECT;
+#define SNIFF   0
+#define CONNECT 1
+#define CONFIGURATION   2
+
+uint8_t deviceMode=CONNECT;
 
 byte packetBuffer[512]; //buffer to hold incoming and outgoing packets
 
@@ -318,7 +330,7 @@ void connectToRouter(){
             }
         }
         Serial.println();
-        //printWifiStatus();
+        printWifiStatus();
         Serial.print("UDP server started at port ");
         Serial.println(localPort);
         //Udp.begin(localPort);
@@ -342,6 +354,14 @@ void dumpEEPROM(int limit){
         Serial.println( hex[EEPROM.read(i)&0x0F]);
     }
 
+}
+
+void clearEEPROM(){
+    Serial.println("clearing EEPROM");
+    for(int i=0;i<512;i++){
+        EEPROM.write(i,0);
+    }
+    EEPROM.commit();
 }
 
 void handleUDP(){
@@ -455,11 +475,7 @@ void handleUDP(){
         if(!wifi && numBytes>=5){
             bool clear=arrayCompare((byte*) packetBuffer,(byte*) clearKeyword, 5); 
             if(clear){
-                Serial.println("clearing EEPROM");
-                for(int i=0;i<512;i++){
-                    EEPROM.write(i,0);
-                }
-                EEPROM.commit();
+                clearEEPROM();
             } 
         }
     }
@@ -483,10 +499,33 @@ void promiscMode(){
     startedChannel=wifi_get_channel();
 }
 
-void setup()
-{
+//circular buffer to allow for handling double press, long press etcetera
+unsigned long int buttonStates[4]={0,0,0,0};
+uint8_t buttonStateIndex=0;
+#define BUTTON_DEBOUNCE_TIME 10
+//interrupt routine called when button is pressed
+void buttonPressed(){
+    Serial.println("button press registered");
+    buttonStates[buttonStateIndex]=millis(); 
+    if(digitalRead(BUTTON)==0){
+        if(deviceMode==CONFIGURATION){
+            Serial.println("exitting configuration mode to SNIFF mode");
+            deviceMode=SNIFF;
+        }
+        else{
+            Serial.println("setting configuration mode");
+                deviceMode=CONFIGURATION;
+        }
+    }
+    buttonStateIndex=(buttonStateIndex+1)%4;
+}
+
+void setup(){
     // Open serial communications and wait for port to open:
     Serial.begin(115200);
+    //set interrupt routine for button
+    attachInterrupt(digitalPinToInterrupt(BUTTON), buttonPressed, CHANGE);
+    pinMode(BUTTON,INPUT_PULLUP);
     getMac();
     EEPROM.begin(512);
     int index=0;
@@ -546,10 +585,12 @@ void setup()
             Serial.print(" ");
             printHex(macTable, 0, 6*numMacs);
         }
-        Serial.print("\n");
-    }
+        Serial.print("\n"); }
     //get wifi credentials through hotspot if there are none stored 
     else{
+        deviceMode=CONFIGURATION;
+    }
+    if(deviceMode==CONFIGURATION){
         Serial.println("no stored credentials found");
         Serial.println("starting hotspot");
         WiFi.mode(WIFI_AP_STA);
@@ -560,9 +601,9 @@ void setup()
         while(ssidBuf==NULL || passwdBuf==NULL){
             handleUDP();
         }
+        deviceMode=CONNECT;
     }
-    //deviceMode=(EEPROM.read(511)==1); 
-    deviceMode=CONNECT; 
+    deviceMode=(EEPROM.read(511)==1); 
     if(deviceMode==SNIFF){
         Serial.println("going into sniff mode");
         promiscMode();
@@ -574,11 +615,12 @@ void setup()
     }
     pinMode(A0, INPUT);
     pinMode(MOTION_PIN, INPUT);
+    pinMode(TEMPERATURE_PIN, INPUT_PULLUP);
 }
 unsigned long lastPrint=0;
 void loop()
 {
-    delay(5000);
+    delay(10);
     if(deviceMode==SNIFF && millis()-lastPrint>=5000){
         printMacTable();
         lastPrint=millis();
@@ -609,31 +651,24 @@ void loop()
         handleUDP();
         //send data to the server 
         lastTransmit=millis();
-        int check=DHT.read11(DHT_PIN);
-        int temp=DHT.temperature;
-        int humidity=DHT.humidity;
+    
+        sensors.requestTemperatures(); // Send the command to get temperatures
+        float temp=sensors.getTempCByIndex(0);
         int motion=digitalRead(MOTION_PIN);
         digitalWrite(LED,motion);
         int light=analogRead(A0);
         String tempString= String(temp);
-        String humidityString= String(humidity);
         String motionString= String(motion);
         String lightString= String(light);
-        if(temp>-10 and temp<50){
-            Serial.print("t:");
-            Serial.print(tempString);
-        }
-        if(humidity>=0 and humidity<=100){
-            Serial.print(" h:");
-            Serial.print(humidityString);
-        }
         Serial.print(" motion:");
         Serial.print(motionString);
         Serial.print(" light:");
         Serial.print(lightString);
         Serial.print(" button:");
         Serial.print(digitalRead(BUTTON));
-
+        Serial.print(" temperature:");
+        Serial.println(tempString);
+    
         //send motion
         Udp.beginPacket(serverIP, destPort);
         Udp.print(macAddress);
@@ -641,16 +676,6 @@ void loop()
         Udp.print("motion-");
         Udp.print(motionString);
         Udp.endPacket();
-
-        if(humidity>=0 and humidity<=100){
-            //send humidity
-            Udp.beginPacket(serverIP, destPort);
-            Udp.print(macAddress);
-            Udp.print("-");
-            Udp.print("humidity-");
-            Udp.print(humidityString);
-            Udp.endPacket();
-        }
 
         if(temp>-10 and temp<50){
             //send temperature
@@ -661,13 +686,6 @@ void loop()
             Udp.print(tempString);
             Udp.endPacket();
         }
-       for(int i=0; i<numMacs;i++){ 
-           if(EEPROM.read(510-i)){
-               //printMac((char*) macTable+(sizeof(byte)*6*i));
-               //Serial.print("\n");
-           }
-       }
-        Serial.print("\n");
 
         //send light level
         Udp.beginPacket(serverIP, destPort);
@@ -676,12 +694,26 @@ void loop()
         Udp.print("light-");
         Udp.print(lightString);
         Udp.endPacket();
+        
+        for(int i=0; i<numMacs;i++){ 
+            if(EEPROM.read(510-i)){
+                printMac((char*) macTable+(sizeof(byte)*6*i));
+                Serial.print("\n");
+            }
+        }
 
         EEPROM.write(511,0);
         EEPROM.commit();
-        //Serial.println("restarting");
-        //ESP.restart();
-        //while(true){
-        //}
+        Serial.println("waiting for response from server");
+        long unsigned int startedWaiting=millis();
+        while(millis()-startedWaiting < 5000){
+            handleUDP();
+            //so wifi stack doesn't fail
+            delay(10);
+        }
+        Serial.println("restarting");
+        ESP.restart();
+        while(true){
+        }
     }
 }
