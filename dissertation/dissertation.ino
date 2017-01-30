@@ -6,7 +6,7 @@
  */
 
 #include "ESP8266WiFi.h"
-#include "ESP8266Ping.h"
+//#include "ESP8266Ping.h"
 #include <WiFiUdp.h>
 #include <EEPROM.h>
 #include <OneWire.h>
@@ -29,7 +29,7 @@ extern "C" {
 #define MOTION_PIN 12
 #define LED 5
 #define BUTTON 4
-#define TRANSMIT_INTERVAL 25000
+#define TRANSMIT_INTERVAL 60000
 #define HOP_INTERVAL 2000
 
 extern "C" {  //required for read Vdd Voltage
@@ -37,11 +37,11 @@ extern "C" {  //required for read Vdd Voltage
 }
 // Data wire is plugged into pin 2 on the Arduino
 #define ONE_WIRE_BUS 2
- 
+
 // Setup a oneWire instance to communicate with any OneWire devices 
 // (not just Maxim/Dallas temperature ICs)
 OneWire oneWire(ONE_WIRE_BUS);
- 
+
 // Pass our oneWire reference to Dallas Temperature.
 DallasTemperature sensors(&oneWire);
 
@@ -57,9 +57,10 @@ const char* macKeyword="macs:(";
 const char* clearKeyword="clear";
 byte macAddressHex[6];
 char macAddress[13];
-unsigned int localPort = 1234;// local port to listen for UDP packets
-unsigned int destPort = 1234; 
+unsigned short localPort = 1234;// local port to listen for UDP packets
+unsigned short destPort = 1234; 
 const char* serverIP = "109.228.52.225";      // local port to listen for UDP packets
+//const char* serverIP = "192.168.0.18";      // local port to listen for UDP packets
 const char* hex ="0123456789ABCDEF";
 char ssidBuf[64];//=NULL;
 char passwdBuf[64];//=NULL;
@@ -76,8 +77,8 @@ byte packetBuffer[512]; //buffer to hold incoming and outgoing packets
 // A UDP instance to let us send and receive packets over UDP
 WiFiUDP Udp;
 
-unsigned long lastSeen[10];
-byte macTable[60];
+unsigned long* lastSeen;
+byte* macTable;
 uint8_t numMacs=0;
 
 //compare to byte arrays for equality
@@ -105,7 +106,7 @@ void printHex(uint8_t *data, uint8_t start, uint8_t length){
 }
 
 char* formatMac(char* data){
-    char* macStr=(char*) malloc(sizeof(char)*(6*3));
+    char* macStr=(char*) os_malloc(sizeof(char)*(6*3));
     byte first;
     int j=0;
     for (uint8_t i=0; i<6; i++) 
@@ -125,16 +126,7 @@ void printMac(char* data){
     char* macStr=formatMac(data);
     int i=0;
     Serial.print(macStr);
-    /*
-       while(true){
-       if(macStr[i]=='\0'){
-       break;
-       }
-       Serial.print(macStr[i]); 
-       i++; 
-       }
-     */
-    free(macStr);
+    os_free(macStr);
 }
 
 void channelHop()
@@ -235,19 +227,22 @@ void printWifiStatus() {
     Serial.print("BSSID: ");
     printMac((char*) WiFi.BSSID());
     Serial.print("\n");
-    Serial.print("Ping: ");
-    bool ret = Ping.ping("www.google.com");
-    Serial.println(ret);
+    //Serial.print("Ping: ");
+    //bool ret = Ping.ping("www.google.com");
+    //Serial.println(ret);
 
     IPAddress ip = WiFi.localIP();
-    Serial.print("IP Address: ");
+    Serial.print("Station IP Address: ");
+    Serial.println(ip);
+    ip = WiFi.softAPIP();
+    Serial.print("AP IP Address: ");
     Serial.println(ip);
     Serial.print("MAC Address: ");
     Serial.println(macAddress);
 }
 
 void writeCredentials(String ssid, String pass){
-    String writeString=wifiKeyword + ssid + "-" + pass +')' + '\0';
+    String writeString=wifiKeyword + ssid + "," + pass +')' + '\0';
     for(int i=0;i<writeString.length();i++){
         EEPROM.write(i,writeString.charAt(i));
     }
@@ -310,16 +305,14 @@ void writeMac(String mac){
 
 void connectToRouter(){
     deviceMode=CONNECT;
-    Serial.print("used memory:");
-    Serial.println(system_get_free_heap_size());
     if(ssidBuf != NULL && passwdBuf != NULL){
         // Wait for connection to AP
         Serial.print("[Connecting]");
         Serial.print(ssidBuf);
         Serial.print(",");
         Serial.print(passwdBuf);
-        //WiFi.begin(ssidBuf, passwdBuf);
-        //WiFi.begin(ssid, passwd);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(ssidBuf, passwdBuf);
         int tries=0;
         while(WiFi.status() != WL_CONNECTED) {
             delay(500);
@@ -330,9 +323,9 @@ void connectToRouter(){
             }
         }
         Serial.println();
-        printWifiStatus();
-        Serial.print("UDP server started at port ");
-        Serial.println(localPort);
+        //printWifiStatus();
+        //Serial.print("UDP server started at port ");
+        //Serial.println(localPort);
         //Udp.begin(localPort);
     }
     else{
@@ -418,7 +411,7 @@ void handleUDP(){
                 String passwd="";
                 bool onPasswd=false;
                 for(int i=6; i<numBytes; i++){
-                    if(receivedCommand[i]=='-'){
+                    if(receivedCommand[i]==','){
                         onPasswd=true;
                     }
                     else if(receivedCommand[i]==')'){
@@ -437,14 +430,11 @@ void handleUDP(){
                 Serial.print("#");
                 Serial.print(passwd);
                 Serial.println("#");
-                free(ssidBuf);
-                free(passwdBuf);
                 //ssidBuf=(char*) malloc((ssid.length()+1)*sizeof(char));
                 //passwdBuf=(char*) malloc((passwd.length()+1)*sizeof(char));
                 ssid.toCharArray(ssidBuf, ssid.length()+1);
                 passwd.toCharArray(passwdBuf, passwd.length()+1);
                 writeCredentials(ssid,passwd);
-                connectToRouter();
             }
             else{
                 bool macs=true;
@@ -502,34 +492,49 @@ void promiscMode(){
 //circular buffer to allow for handling double press, long press etcetera
 unsigned long int buttonStates[4]={0,0,0,0};
 uint8_t buttonStateIndex=0;
-#define BUTTON_DEBOUNCE_TIME 10
+#define BUTTON_DEBOUNCE_TIME 100
 //interrupt routine called when button is pressed
 void buttonPressed(){
-    Serial.println("button press registered");
-    buttonStates[buttonStateIndex]=millis(); 
-    if(digitalRead(BUTTON)==0){
-        if(deviceMode==CONFIGURATION){
-            Serial.println("exitting configuration mode to SNIFF mode");
-            deviceMode=SNIFF;
-        }
-        else{
-            Serial.println("setting configuration mode");
+    if(millis()-buttonStates[(buttonStateIndex-1)%4]>BUTTON_DEBOUNCE_TIME){
+        Serial.println("button press registered");
+        buttonStateIndex=(buttonStateIndex+1)%4;
+        buttonStates[buttonStateIndex]=millis(); 
+        if(digitalRead(BUTTON)==0){
+            if(deviceMode==CONFIGURATION){
+                Serial.println("exitting configuration mode to SNIFF mode");
+                deviceMode=SNIFF;
+                digitalWrite(LED,LOW);
+            }
+            else{
+                connectToRouter();
                 deviceMode=CONFIGURATION;
+                Serial.println("starting hotspot");
+                digitalWrite(LED,HIGH);
+                WiFi.mode(WIFI_AP_STA);
+                WiFi.softAP(macAddress,"crocodile");
+                Serial.print("UDP server started at port ");
+                Serial.println(localPort);
+                Udp.begin(localPort);
+            }
         }
     }
-    buttonStateIndex=(buttonStateIndex+1)%4;
 }
 
 void setup(){
     // Open serial communications and wait for port to open:
     Serial.begin(115200);
-    //set interrupt routine for button
-    attachInterrupt(digitalPinToInterrupt(BUTTON), buttonPressed, CHANGE);
+    ////set interrupt routine for button
     pinMode(BUTTON,INPUT_PULLUP);
+    //attachInterrupt(digitalPinToInterrupt(BUTTON), buttonPressed, CHANGE);
+    sensors.begin();
     getMac();
     EEPROM.begin(512);
+    pinMode(A0, INPUT);
+    pinMode(MOTION_PIN, INPUT);
+    pinMode(TEMPERATURE_PIN, INPUT_PULLUP);
+    pinMode(LED, OUTPUT);
     int index=0;
-    //check for stored wifi credentials
+    ////check for stored wifi credentials
     bool wifi=true;
     for(int i=0;i<6;i++){
         if( EEPROM.read(i)!=wifiKeyword[i]){
@@ -544,7 +549,7 @@ void setup(){
         bool onPasswd=false;
         for(index=6;index<512;index++){
             char c=EEPROM.read(index);
-            if(c=='-'){
+            if(c==','){
                 onPasswd=true;
             }
             else if (c==')'){
@@ -557,8 +562,6 @@ void setup(){
                 ssid+=c;
             }
         }
-        //ssidBuf=(char*) malloc(sizeof(char)*(ssid.length()+1));
-        //passwdBuf=(char*) malloc(sizeof(char)*(passwd.length()+1));
         ssid.toCharArray(ssidBuf, ssid.length()+1);
         passwd.toCharArray(passwdBuf, passwd.length()+1);
         Serial.print("ssid:");
@@ -570,14 +573,13 @@ void setup(){
         index+=1;
         Serial.print(numMacs);
         Serial.print(" stored macs:");
+        macTable=(byte*) os_malloc(6*numMacs*sizeof(char));
+        lastSeen=(unsigned long int*) os_malloc(numMacs*sizeof(unsigned long int));
         if(numMacs > 0){
             int finalIndex=index + (numMacs*6);
-            //macTable=(byte*) malloc(sizeof(byte)*numMacs*6);
-            //lastSeen=(unsigned long*) malloc(sizeof(unsigned long)*numMacs);
             int i=0;
             for(;index<=finalIndex;index++){
                 macTable[i]=EEPROM.read(index);
-                lastSeen[i]=0;
                 Serial.print(EEPROM.read(index));
                 Serial.print(" ");
                 i++;
@@ -585,22 +587,34 @@ void setup(){
             Serial.print(" ");
             printHex(macTable, 0, 6*numMacs);
         }
-        Serial.print("\n"); }
+        for(int i=0; i<numMacs; i++){
+            lastSeen[i]=0;
+        }
+        Serial.print("\n"); 
+    }
     //get wifi credentials through hotspot if there are none stored 
     else{
+        Serial.println("no stored credentials found");
+        deviceMode=CONFIGURATION;
+    }
+    if(digitalRead(BUTTON)==0){
+        Serial.println("button pressed, going into configuration made");
         deviceMode=CONFIGURATION;
     }
     if(deviceMode==CONFIGURATION){
-        Serial.println("no stored credentials found");
         Serial.println("starting hotspot");
+        digitalWrite(LED,HIGH);
         WiFi.mode(WIFI_AP_STA);
         WiFi.softAP(macAddress,"crocodile");
         Serial.print("UDP server started at port ");
         Serial.println(localPort);
         Udp.begin(localPort);
-        while(ssidBuf==NULL || passwdBuf==NULL){
+        while(deviceMode==CONFIGURATION){
             handleUDP();
         }
+        digitalWrite(LED,LOW);
+        Serial.println("exitting configuration mode");
+        WiFi.mode(WIFI_STA);
         deviceMode=CONNECT;
     }
     deviceMode=(EEPROM.read(511)==1); 
@@ -613,14 +627,15 @@ void setup(){
         Serial.println("going into connect mode");
         connectToRouter();
     }
-    pinMode(A0, INPUT);
-    pinMode(MOTION_PIN, INPUT);
-    pinMode(TEMPERATURE_PIN, INPUT_PULLUP);
+    Serial.println();
 }
+
 unsigned long lastPrint=0;
-void loop()
-{
+void loop(){
     delay(10);
+    if(deviceMode==CONFIGURATION){
+        handleUDP();
+    }
     if(deviceMode==SNIFF && millis()-lastPrint>=5000){
         printMacTable();
         lastPrint=millis();
@@ -648,14 +663,12 @@ void loop()
     }
 
     if(deviceMode==CONNECT){
-        handleUDP();
         //send data to the server 
         lastTransmit=millis();
-    
+
         sensors.requestTemperatures(); // Send the command to get temperatures
         float temp=sensors.getTempCByIndex(0);
         int motion=digitalRead(MOTION_PIN);
-        digitalWrite(LED,motion);
         int light=analogRead(A0);
         String tempString= String(temp);
         String motionString= String(motion);
@@ -668,7 +681,8 @@ void loop()
         Serial.print(digitalRead(BUTTON));
         Serial.print(" temperature:");
         Serial.println(tempString);
-    
+
+        delay(100); 
         //send motion
         Udp.beginPacket(serverIP, destPort);
         Udp.print(macAddress);
@@ -677,16 +691,16 @@ void loop()
         Udp.print(motionString);
         Udp.endPacket();
 
-        if(temp>-10 and temp<50){
-            //send temperature
-            Udp.beginPacket(serverIP, destPort);
-            Udp.print(macAddress);
-            Udp.print("-");
-            Udp.print("temperature-");
-            Udp.print(tempString);
-            Udp.endPacket();
-        }
+        delay(100); 
+        //send temperature
+        Udp.beginPacket(serverIP, destPort);
+        Udp.print(macAddress);
+        Udp.print("-");
+        Udp.print("temperature-");
+        Udp.print(tempString);
+        Udp.endPacket();
 
+        delay(100); 
         //send light level
         Udp.beginPacket(serverIP, destPort);
         Udp.print(macAddress);
@@ -694,11 +708,28 @@ void loop()
         Udp.print("light-");
         Udp.print(lightString);
         Udp.endPacket();
-        
+
+
         for(int i=0; i<numMacs;i++){ 
             if(EEPROM.read(510-i)){
-                printMac((char*) macTable+(sizeof(byte)*6*i));
-                Serial.print("\n");
+                char mac[13];
+                for(int j=0;j<12;j++){
+                    if(j%2==0){
+                        mac[j]=hex[macTable[(6*i)+(j/2)]>>4];
+                    }
+                    else{
+                        mac[j]=hex[macTable[(6*i)+(j/2)]&0x0F];
+                    }
+                }
+                mac[12]='\0';
+                Serial.println(mac);
+                delay(100); 
+                Udp.beginPacket(serverIP, destPort);
+                Udp.print(macAddress);
+                Udp.print("-");
+                Udp.print("network-");
+                Udp.print(mac);
+                Udp.endPacket();
             }
         }
 
@@ -713,7 +744,5 @@ void loop()
         }
         Serial.println("restarting");
         ESP.restart();
-        while(true){
-        }
     }
 }
