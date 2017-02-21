@@ -1,0 +1,13 @@
+\contentsline {chapter}{\numberline {1}Introduction}{7}
+\contentsline {section}{\numberline {1.1}Designing The Hardware}{7}
+\contentsline {subsection}{\numberline {1.1.1}Requirements}{7}
+\contentsline {subsection}{\numberline {1.1.2}Wireless Communication}{7}
+\contentsline {subsection}{\numberline {1.1.3}Microcontroller}{8}
+\contentsline {subsection}{\numberline {1.1.4}Temperature sensor}{8}
+\contentsline {subsection}{\numberline {1.1.5}Circuit Design}{8}
+\contentsline {subsection}{\numberline {1.1.6}Improvements to Circuit}{8}
+\contentsline {subsection}{\numberline {1.1.7}Fabricating the Sensors}{10}
+\contentsline {section}{\numberline {1.2}The Server}{11}
+\contentsline {subsection}{\numberline {1.2.1}The Database}{11}
+\contentsline {subsection}{\numberline {1.2.2}The Daemon}{11}
+\contentsline {section}{\numberline {1.3}Still to Do}{11}
